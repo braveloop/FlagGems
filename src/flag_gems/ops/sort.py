@@ -19,10 +19,12 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.topk import _get_finfo_val, _get_iinfo_val, argsort
+from flag_gems.runtime import device as runtime_device
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
+GLOBAL_HISTOGRAM_MIN_N = 1024
 
 
 def unwrap_if_constexpr(o):
@@ -156,6 +158,64 @@ def compute_global_hist_kernel(
 
 
 @triton.jit
+def compute_global_hist_kernel_metax_fp32_k4(
+    arr_ptr,
+    out_ptr,
+    num_passes,
+    m,
+    n,
+    tiles_n_per_cta,
+    TILE_N: tl.constexpr,
+    TILE_R: tl.constexpr,
+    num_bits_per_pass: tl.constexpr,
+    descending: tl.constexpr,
+):
+    """MetaX FP32/k_bits=4 histogram without a bin-by-element matrix."""
+    tl.static_assert(num_bits_per_pass == 4)
+    pid = tl.program_id(0)
+    pid_n = pid // m
+    pid_m = pid % m
+
+    r: tl.constexpr = 16
+    histogram_bins: tl.constexpr = 32
+    bfe_mask: tl.constexpr = r - 1
+    CTA_TILE_N: tl.constexpr = TILE_N * tiles_n_per_cta
+    cta_n_start = CTA_TILE_N * pid_n
+    cta_n_end = tl.minimum(cta_n_start + CTA_TILE_N, n)
+    bin_indices = tl.arange(0, histogram_bins)
+
+    for p in range(0, num_passes):
+        bit_offset = p * num_bits_per_pass
+        acc = tl.zeros((histogram_bins,), dtype=tl.int32)
+        for n_start in range(cta_n_start, cta_n_end, TILE_N):
+            n_offsets = n_start + tl.arange(0, TILE_N)
+            mask = n_offsets < cta_n_end
+            arr = tl.load(arr_ptr + pid_m * n + n_offsets, mask=mask, other=0.0)
+            arr = convert_to_uint_preverse_order(arr, descending)
+            key = ((arr >> bit_offset) & bfe_mask).to(tl.int32)
+            # Padding lanes use bin 16; only the 16 radix bins are written.
+            key = tl.where(mask, key, r)
+            acc += tl.histogram(key, histogram_bins).to(tl.int32)
+        tl.atomic_add(
+            out_ptr + pid_m * num_passes * r + p * r + bin_indices,
+            acc,
+            mask=bin_indices < r,
+            sem="relaxed",
+        )
+
+
+def _select_global_hist_kernel(dtype, k_bits, n):
+    if (
+        runtime_device.vendor_name == "metax"
+        and dtype == torch.float32
+        and k_bits == 4
+        and n >= GLOBAL_HISTOGRAM_MIN_N
+    ):
+        return compute_global_hist_kernel_metax_fp32_k4
+    return compute_global_hist_kernel
+
+
+@triton.jit
 def sweep(
     arr_ptr,
     associate_arr_ptr,  # inputs: (key & value)
@@ -277,7 +337,8 @@ def radix_sort(arr, k_bits=8, descending=False):
         global_hist = torch.zeros(
             (m, n_passes, num_bins), device=arr.device, dtype=torch.int32
         )
-        compute_global_hist_kernel[grid_for_global_hist](
+        global_hist_kernel = _select_global_hist_kernel(dtype, k_bits, n)
+        global_hist_kernel[grid_for_global_hist](
             arr,
             global_hist,
             n_passes,
