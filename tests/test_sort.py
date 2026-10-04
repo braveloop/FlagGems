@@ -95,16 +95,28 @@ def test_sort_stable(batch_size, hiddensize, descending, dtype, dim):
 
 def _metax_radix_sort_candidate_and_original(y, descending):
     sort_module = importlib.import_module("flag_gems.ops.sort")
-    original_selector = sort_module._select_global_hist_kernel
+    original_hist_selector = sort_module._select_global_hist_kernel
+    original_sweep_selector = sort_module._select_sweep_skip_empty_bins
+    original_global_sweep_selector = (
+        sort_module._select_sweep_skip_global_empty_bins
+    )
     with flag_gems.use_gems():
         candidate = sort_module.radix_sort(y, k_bits=4, descending=descending)
         sort_module._select_global_hist_kernel = (
             lambda dtype, k_bits, n: sort_module.compute_global_hist_kernel
         )
+        sort_module._select_sweep_skip_empty_bins = lambda dtype, k_bits, n: False
+        sort_module._select_sweep_skip_global_empty_bins = (
+            lambda dtype, k_bits, n: False
+        )
         try:
             original = sort_module.radix_sort(y, k_bits=4, descending=descending)
         finally:
-            sort_module._select_global_hist_kernel = original_selector
+            sort_module._select_global_hist_kernel = original_hist_selector
+            sort_module._select_sweep_skip_empty_bins = original_sweep_selector
+            sort_module._select_sweep_skip_global_empty_bins = (
+                original_global_sweep_selector
+            )
     return candidate, original
 
 
@@ -186,3 +198,140 @@ def test_sort_metax_fp32_radix_histogram_special_bits(hiddensize, descending):
         candidate_value.view(torch.int32), original_value.view(torch.int32)
     )
     utils.gems_assert_equal(candidate_index, original_index)
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix histogram specialization is MetaX-only",
+)
+@pytest.mark.parametrize(
+    "batch_size,hiddensize,descending,distribution",
+    [
+        (16, 2047, False, "equal"),
+        (64, 2048, True, "equal"),
+        (16, 2049, True, "gapped"),
+        (64, 8193, False, "gapped"),
+        (64, 130560, False, "gapped"),
+        (64, 130560, True, "gapped"),
+    ],
+)
+def test_sort_metax_fp32_radix_sparse_bins(
+    batch_size, hiddensize, descending, distribution
+):
+    """Preserve stable order when most radix bins are empty."""
+    row_offsets = torch.arange(batch_size, dtype=torch.int32).unsqueeze(1) << 8
+    a_bits = 0x3F800001 + row_offsets
+    b_bits = 0x3F80000E + row_offsets
+    input_bits = a_bits.expand(batch_size, hiddensize).clone()
+
+    if distribution == "gapped":
+        tile_n = 2048
+        last_tile_start = ((hiddensize - 1) // tile_n) * tile_n
+        input_bits[:, tile_n:last_tile_start] = b_bits
+        if hiddensize == 2049:
+            input_bits[:, 2047] = b_bits[:, 0]
+
+    input_bits_before = input_bits.clone()
+    y_cpu = input_bits.view(torch.float32)
+    ref_value, ref_index = torch.sort(
+        y_cpu, dim=-1, stable=True, descending=descending
+    )
+    y = y_cpu.to(flag_gems.device)
+    y_bits_before = y.view(torch.int32).clone()
+
+    (candidate_value, candidate_index), (original_value, original_index) = (
+        _metax_radix_sort_candidate_and_original(y, descending)
+    )
+
+    ref_bits = ref_value.view(torch.int32).to(flag_gems.device)
+    ref_index = ref_index.to(flag_gems.device)
+    for value, index in (
+        (candidate_value, candidate_index),
+        (original_value, original_index),
+    ):
+        utils.gems_assert_equal(value.view(torch.int32), ref_bits)
+        utils.gems_assert_equal(index, ref_index)
+
+    assert torch.equal(input_bits, input_bits_before)
+    utils.gems_assert_equal(y.view(torch.int32), y_bits_before)
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix sweep specialization is MetaX-only",
+)
+@pytest.mark.parametrize("hiddensize,expected", [(2047, False), (2048, True)])
+def test_sort_metax_fp32_radix_global_empty_selector(hiddensize, expected):
+    sort_module = importlib.import_module("flag_gems.ops.sort")
+    assert (
+        sort_module._select_sweep_skip_global_empty_bins(
+            torch.float32, 4, hiddensize
+        )
+        is expected
+    )
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix sweep specialization is MetaX-only",
+)
+@pytest.mark.parametrize(
+    "batch_size,hiddensize,descending,distribution",
+    [
+        (1, 2047, False, "equal"),
+        (16, 2048, True, "equal"),
+        (64, 2049, False, "local_empty"),
+        (16, 4097, True, "cross_row"),
+        (64, 8193, False, "local_empty"),
+        (64, 130560, True, "cross_row"),
+    ],
+)
+def test_sort_metax_fp32_radix_global_empty_bins(
+    batch_size, hiddensize, descending, distribution
+):
+    """Skip only row-global empty bins and preserve stable ordering."""
+    positions = torch.arange(hiddensize, dtype=torch.int32).unsqueeze(0)
+    rows = torch.arange(batch_size, dtype=torch.int32).unsqueeze(1)
+    if distribution == "equal":
+        input_bits = torch.full(
+            (batch_size, hiddensize), 0x3F800001, dtype=torch.int32
+        )
+    elif distribution == "local_empty":
+        input_bits = torch.where(
+            positions < 2048,
+            torch.tensor(0x3F800001, dtype=torch.int32),
+            torch.tensor(0x3F80000E, dtype=torch.int32),
+        ).expand(batch_size, hiddensize).clone()
+    else:
+        input_bits = (
+            0x3F000001
+            + ((rows % 8) << 20)
+            + ((positions // 2048) % 2) * 13
+        ).to(torch.int32)
+
+    input_bits_before = input_bits.clone()
+    y_cpu = input_bits.view(torch.float32)
+    ref_value, ref_index = torch.sort(
+        y_cpu, dim=-1, stable=True, descending=descending
+    )
+    y = y_cpu.to(flag_gems.device)
+    y_bits_before = y.view(torch.int32).clone()
+
+    (candidate_value, candidate_index), (original_value, original_index) = (
+        _metax_radix_sort_candidate_and_original(y, descending)
+    )
+
+    ref_bits = ref_value.view(torch.int32).to(flag_gems.device)
+    ref_index = ref_index.to(flag_gems.device)
+    for value, index in (
+        (candidate_value, candidate_index),
+        (original_value, original_index),
+    ):
+        utils.gems_assert_equal(value.view(torch.int32), ref_bits)
+        utils.gems_assert_equal(index, ref_index)
+
+    assert torch.equal(input_bits, input_bits_before)
+    utils.gems_assert_equal(y.view(torch.int32), y_bits_before)
