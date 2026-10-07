@@ -233,6 +233,16 @@ def _select_sweep_skip_global_empty_bins(dtype, k_bits, n):
     )
 
 
+def _select_sweep_use_int32_indices(dtype, k_bits, n, numel):
+    return (
+        runtime_device.vendor_name == "metax"
+        and dtype == torch.float32
+        and k_bits == 4
+        and 2048 <= n < (1 << 30)
+        and numel <= (1 << 31) - 1
+    )
+
+
 @triton.jit
 def sweep(
     arr_ptr,
@@ -254,6 +264,7 @@ def sweep(
     descending: tl.constexpr,
     SKIP_EMPTY_BINS: tl.constexpr = False,
     SKIP_GLOBAL_EMPTY_BINS: tl.constexpr = False,
+    USE_INT32_INDICES: tl.constexpr = False,
 ):
     # r: num_bins = 2 ** k_bits
     # OUT_N: grid_n = cdiv(N, )
@@ -270,6 +281,10 @@ def sweep(
     pid_m = pid % m
     pid_n = pid // m
     pid_r = tl.program_id(1)
+    pid_m_offset = pid_m
+    if USE_INT32_INDICES:
+        pid_m_offset = pid_m.to(tl.int64)
+    row_offset = pid_m_offset * N
 
     # bit masks
     aggregate_mask: tl.constexpr = 1 << 30
@@ -285,15 +300,15 @@ def sweep(
     # cumsum for a bin_index
     n_offsets = pid_n * TILE_N + tl.arange(0, TILE_N)  # (TILE_N, )
     mask = n_offsets < N
-    arr = tl.load(arr_ptr + pid_m * N + n_offsets, mask=mask)
+    arr = tl.load(arr_ptr + row_offset + n_offsets, mask=mask)
     arr_u = convert_to_uint_preverse_order(arr, descending)
     key = (arr_u >> bit_offset) & bfe_mask  # (TILE_N, )
     if associate_arr_ptr is not None:
-        associate_arr = tl.load(associate_arr_ptr + pid_m * N + n_offsets, mask=mask)
+        associate_arr = tl.load(associate_arr_ptr + row_offset + n_offsets, mask=mask)
     # since triton can only use scalar as condition, loop by bin_index
     # status must be pre zero-initialized, or else we have to initialize it
     for bin_index in range(cta_r_start, cta_r_end):
-        hist_offset = pid_m * (n_passes * r) + pass_id * r + bin_index
+        hist_offset = pid_m_offset * (n_passes * r) + pass_id * r + bin_index
         process_bin = True
         if SKIP_GLOBAL_EMPTY_BINS:
             global_sum = tl.load(global_hist_ptr + hist_offset)
@@ -304,14 +319,18 @@ def sweep(
             # CAUTION: tl.sum in triton 3.2 does not promote type
             local_sum = tl.sum(matches.to(tl.uint32), axis=0)
             pack0 = aggregate_mask | local_sum
-            status_offset = pid_m * (r * OUT_N) + bin_index * OUT_N + pid_n
+            status_offset = (
+                pid_m_offset * (r * OUT_N) + bin_index * OUT_N + pid_n
+            )
             tl.store(status_ptr + status_offset, pack0, cache_modifier=".cg")
 
             # decoupled lookback
             exclusive_prefix = tl.zeros((), dtype=tl.uint32)
             i_lookback = pid_n - 1
             while i_lookback >= 0:
-                flag_offset_i = pid_m * (r * OUT_N) + bin_index * OUT_N + i_lookback
+                flag_offset_i = (
+                    pid_m_offset * (r * OUT_N) + bin_index * OUT_N + i_lookback
+                )
                 pack1 = tl.load(status_ptr + flag_offset_i, volatile=True)  # uin32
                 while pack1 == 0:
                     pack1 = tl.load(status_ptr + flag_offset_i, volatile=True)
@@ -336,10 +355,10 @@ def sweep(
                 pos = ex_cumsum_bins + ex_cumsum_in_bin  # (TILE_N, )
 
                 # scatter
-                tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
+                tl.store(out_ptr + row_offset + pos, arr, mask=matches)
                 if associate_arr_ptr is not None:
                     tl.store(
-                        associate_out_ptr + pid_m * N + pos,
+                        associate_out_ptr + row_offset + pos,
                         associate_arr,
                         mask=matches,
                     )
@@ -385,13 +404,22 @@ def radix_sort(arr, k_bits=8, descending=False):
 
         # sort
         arr_in = torch.clone(arr)
+        use_int32_indices = _select_sweep_use_int32_indices(
+            dtype, k_bits, n, arr.numel()
+        )
+        index_dtype = torch.int32 if use_int32_indices else torch.int64
         indices_in = (
-            torch.arange(0, n, dtype=torch.int64, device=arr_in.device)
+            torch.arange(0, n, dtype=index_dtype, device=arr_in.device)
             .broadcast_to(arr.shape)
             .contiguous()
         )
         arr_out = torch.empty_like(arr)
         indices_out = torch.empty_like(indices_in)
+        final_indices = (
+            torch.empty(arr.shape, dtype=torch.int64, device=arr_in.device)
+            if use_int32_indices
+            else None
+        )
 
         TILE_R = 8
         grid_r = triton.cdiv(num_bins, TILE_R)
@@ -410,11 +438,15 @@ def radix_sort(arr, k_bits=8, descending=False):
         for i in range(0, n_passes):
             bit_offset = i * k_bits
             status.zero_()
+            is_last_pass = i == n_passes - 1
+            associate_out = (
+                final_indices if use_int32_indices and is_last_pass else indices_out
+            )
             sweep[grid_for_sweep](
                 arr_in,
                 indices_in,
                 arr_out,
-                indices_out,
+                associate_out,
                 ex_cumsum_bins,
                 global_hist,
                 status,
@@ -430,10 +462,14 @@ def radix_sort(arr, k_bits=8, descending=False):
                 descending,
                 skip_empty_bins,
                 skip_global_empty_bins,
+                use_int32_indices,
             )
             # print(f"< sorted last {bit_offset + k_bits:>2d} bits: {arr_out}")
             arr_in, arr_out = arr_out, arr_in
-            indices_in, indices_out = indices_out, indices_in
+            if use_int32_indices and is_last_pass:
+                indices_in = final_indices
+            else:
+                indices_in, indices_out = indices_out, indices_in
 
     return arr_in, indices_in
 

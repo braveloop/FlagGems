@@ -100,6 +100,7 @@ def _metax_radix_sort_candidate_and_original(y, descending):
     original_global_sweep_selector = (
         sort_module._select_sweep_skip_global_empty_bins
     )
+    original_index_selector = sort_module._select_sweep_use_int32_indices
     with flag_gems.use_gems():
         candidate = sort_module.radix_sort(y, k_bits=4, descending=descending)
         sort_module._select_global_hist_kernel = (
@@ -109,6 +110,9 @@ def _metax_radix_sort_candidate_and_original(y, descending):
         sort_module._select_sweep_skip_global_empty_bins = (
             lambda dtype, k_bits, n: False
         )
+        sort_module._select_sweep_use_int32_indices = (
+            lambda dtype, k_bits, n, numel: False
+        )
         try:
             original = sort_module.radix_sort(y, k_bits=4, descending=descending)
         finally:
@@ -117,6 +121,22 @@ def _metax_radix_sort_candidate_and_original(y, descending):
             sort_module._select_sweep_skip_global_empty_bins = (
                 original_global_sweep_selector
             )
+            sort_module._select_sweep_use_int32_indices = original_index_selector
+    return candidate, original
+
+
+def _metax_radix_sort_int32_candidate_and_original(y, descending):
+    sort_module = importlib.import_module("flag_gems.ops.sort")
+    original_index_selector = sort_module._select_sweep_use_int32_indices
+    with flag_gems.use_gems():
+        candidate = sort_module.radix_sort(y, k_bits=4, descending=descending)
+        sort_module._select_sweep_use_int32_indices = (
+            lambda dtype, k_bits, n, numel: False
+        )
+        try:
+            original = sort_module.radix_sort(y, k_bits=4, descending=descending)
+        finally:
+            sort_module._select_sweep_use_int32_indices = original_index_selector
     return candidate, original
 
 
@@ -271,6 +291,151 @@ def test_sort_metax_fp32_radix_global_empty_selector(hiddensize, expected):
         )
         is expected
     )
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix index specialization is MetaX-only",
+)
+@pytest.mark.parametrize(
+    "dtype,k_bits,hiddensize,numel,expected",
+    [
+        (torch.float32, 4, 2047, 2047, False),
+        (torch.float32, 4, 2048, 2048, True),
+        (torch.float32, 4, (1 << 30) - 1, (1 << 31) - 1, True),
+        (torch.float32, 4, 1 << 30, 1 << 30, False),
+        (torch.float32, 4, 2048, 1 << 31, False),
+        (torch.float32, 8, 2048, 2048, False),
+        (torch.float16, 4, 2048, 2048, False),
+        (torch.bfloat16, 4, 2048, 2048, False),
+    ],
+)
+def test_sort_metax_fp32_radix_int32_index_selector(
+    dtype, k_bits, hiddensize, numel, expected
+):
+    """Check all bounds without allocating tensors near the limits."""
+    sort_module = importlib.import_module("flag_gems.ops.sort")
+    assert (
+        sort_module._select_sweep_use_int32_indices(
+            dtype, k_bits, hiddensize, numel
+        )
+        is expected
+    )
+
+
+def test_sort_metax_fp32_radix_int32_index_selector_non_metax(monkeypatch):
+    """Keep the existing int64 path on every non-MetaX backend."""
+    sort_module = importlib.import_module("flag_gems.ops.sort")
+    monkeypatch.setattr(sort_module.runtime_device, "vendor_name", "nvidia")
+    assert not sort_module._select_sweep_use_int32_indices(
+        torch.float32, 4, 2048, 2048
+    )
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix index specialization is MetaX-only",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hiddensize", [1024, 2049])
+@pytest.mark.parametrize("descending", [False, True])
+def test_sort_metax_radix_int32_index_dtype_fallback(
+    dtype, hiddensize, descending
+):
+    """Exercise the unchanged int64 path for non-FP32 radix inputs."""
+    sort_module = importlib.import_module("flag_gems.ops.sort")
+    positions = torch.arange(hiddensize, dtype=torch.int32)
+    y = ((positions % 23) - 11).to(dtype).repeat(4, 1).to(flag_gems.device)
+    y_before = y.clone()
+    ref_value, ref_index = torch.sort(
+        utils.to_reference(y), dim=-1, stable=True, descending=descending
+    )
+    assert not sort_module._select_sweep_use_int32_indices(
+        dtype, 4, hiddensize, y.numel()
+    )
+    with flag_gems.use_gems():
+        value, index = torch.sort(y, dim=-1, stable=True, descending=descending)
+    utils.gems_assert_equal(value, ref_value)
+    utils.gems_assert_equal(index, ref_index)
+    assert index.dtype == torch.int64
+    utils.gems_assert_equal(y, y_before)
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix index specialization is MetaX-only",
+)
+@pytest.mark.parametrize(
+    "batch_size,hiddensize,descending",
+    [
+        (1, 2047, False),
+        (16, 2048, True),
+        (64, 2049, False),
+        (16, 8193, True),
+        (64, 130560, False),
+        (64, 130560, True),
+    ],
+)
+def test_sort_metax_fp32_radix_int32_indices(
+    batch_size, hiddensize, descending
+):
+    """Preserve stable int64 indices and all FP32 key bit patterns."""
+    positions = torch.arange(hiddensize, dtype=torch.int32).unsqueeze(0)
+    rows = torch.arange(batch_size, dtype=torch.int32).unsqueeze(1)
+    input_bits = (
+        0x3F000001 + ((rows % 8) << 20) + ((positions // 2048) % 2) * 13
+    ).to(torch.int32)
+    special_bits = torch.tensor(
+        [0, -2147483648, 2139095040, -8388608, 2143289345, -4194303],
+        dtype=torch.int32,
+    )
+    input_bits[:, : special_bits.numel()] = special_bits
+    input_bits_before = input_bits.clone()
+    y = input_bits.view(torch.float32).to(flag_gems.device)
+    y_bits_before = y.view(torch.int32).clone()
+
+    (candidate_value, candidate_index), (original_value, original_index) = (
+        _metax_radix_sort_int32_candidate_and_original(y, descending)
+    )
+    utils.gems_assert_equal(
+        candidate_value.view(torch.int32), original_value.view(torch.int32)
+    )
+    utils.gems_assert_equal(candidate_index, original_index)
+    assert candidate_index.dtype == torch.int64
+    assert original_index.dtype == torch.int64
+    assert torch.equal(input_bits, input_bits_before)
+    utils.gems_assert_equal(y.view(torch.int32), y_bits_before)
+
+
+@pytest.mark.sort
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "metax",
+    reason="The FP32 radix index specialization is MetaX-only",
+)
+@pytest.mark.parametrize("layout", ["noncontiguous_last", "nonlast_dim"])
+def test_sort_metax_fp32_radix_int32_index_layouts(layout):
+    """Preserve the public sort contract after layout normalization."""
+    torch.manual_seed(20261007)
+    if layout == "noncontiguous_last":
+        base = torch.randn((16, 4098), dtype=torch.float32, device=flag_gems.device)
+        y = base[:, ::2]
+        dim = -1
+    else:
+        y = torch.randn((16, 2049, 2), dtype=torch.float32, device=flag_gems.device)
+        dim = 1
+    y_before = y.clone()
+    ref_value, ref_index = torch.sort(
+        utils.to_reference(y), dim=dim, stable=True, descending=True
+    )
+    with flag_gems.use_gems():
+        value, index = torch.sort(y, dim=dim, stable=True, descending=True)
+    utils.gems_assert_equal(value.view(torch.int32), ref_value.view(torch.int32))
+    utils.gems_assert_equal(index, ref_index)
+    assert index.dtype == torch.int64
+    utils.gems_assert_equal(y, y_before)
 
 
 @pytest.mark.sort
