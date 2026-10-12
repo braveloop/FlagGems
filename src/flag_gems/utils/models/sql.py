@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+import re
+import sys
 from hashlib import md5
 from itertools import chain
 from typing import (
@@ -138,10 +140,98 @@ class SQLPersistantModel(PersistantModel):
         return ModelCls
 
     @staticmethod
+    def _default_sqlite_reflection_eligible(engine) -> bool:
+        from flag_gems.runtime.backend import _state
+        from flag_gems.utils.code_cache import cache_dir_path
+
+        libentry = sys.modules.get("flag_gems.utils.libentry")
+        if (
+            _state.vendor_module.vendor_info.vendor_name != "iluvatar"
+            or libentry is None
+            or libentry.FLAGGEMS_DB_URL is not None
+            or os.getenv("FLAGGEMS_DB_URL")
+        ):
+            return False
+        default = cache_dir_path() / "config_cache" / (
+            f"TunedConfig_iluvatar_triton_"
+            f"{libentry.major_version}_{libentry.minor_version}.db"
+        )
+        return (
+            engine.url == sqlalchemy.engine.make_url(f"sqlite:///{default}")
+            and not engine.url.query
+        )
+
+    @staticmethod
+    def _sqlite_reflection_schema_safe(records) -> bool:
+        for kind, name, ddl in records:
+            if kind == "table":
+                if (
+                    not isinstance(ddl, str)
+                    or not ddl
+                    or "\0" in ddl
+                    or not re.match(r"^\s*CREATE\s+TABLE\b", ddl, re.IGNORECASE)
+                    or any(word in ddl.upper() for word in (
+                        "REFERENCES", "FOREIGN", "VIRTUAL"
+                    ))
+                ):
+                    return False
+            elif kind == "index":
+                if ddl is None:
+                    if not name.startswith("sqlite_autoindex_"):
+                        return False
+                elif (
+                    not isinstance(ddl, str)
+                    or "\0" in ddl
+                    or not re.match(
+                        r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", ddl, re.IGNORECASE
+                    )
+                ):
+                    return False
+            else:
+                return False
+        return True
+
+    @staticmethod
     def build_sql_model_by_db(
         name: str,
         engine: sqlalchemy.engine.Engine,
     ) -> Optional[Type[Base]]:
+        try:
+            if SQLPersistantModel._default_sqlite_reflection_eligible(engine):
+                with engine.connect() as connection:
+                    connection.exec_driver_sql("BEGIN")
+                    try:
+                        databases = connection.exec_driver_sql(
+                            "PRAGMA database_list"
+                        ).all()
+                        temp = connection.exec_driver_sql(
+                            "SELECT name FROM temp.sqlite_master LIMIT 1"
+                        ).first()
+                        records = connection.exec_driver_sql(
+                            "SELECT type,name,sql FROM main.sqlite_master"
+                        ).all()
+                        if (
+                            all(row[1] in ("main", "temp") for row in databases)
+                            and temp is None
+                            and SQLPersistantModel._sqlite_reflection_schema_safe(
+                                records
+                            )
+                        ):
+                            target_base = sqlalchemy.ext.automap.automap_base()
+                            target_base.prepare(
+                                connection,
+                                reflection_options={
+                                    "only": lambda table_name, metadata: (
+                                        table_name == name
+                                    )
+                                },
+                            )
+                            return target_base.classes.get(name)
+                    finally:
+                        connection.rollback()
+        except Exception:
+            pass
+
         AutoBase: sqlalchemy.ext.automap.AutomapBase = (
             sqlalchemy.ext.automap.automap_base()
         )

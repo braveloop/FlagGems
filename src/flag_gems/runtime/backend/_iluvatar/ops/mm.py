@@ -47,6 +47,20 @@ def _to_tl_type(ty):
     return getattr(tl, str(ty).split(".")[-1])
 
 
+def _use_grouped_pid(args):
+    """Conservative wide-output geometry; CPU scalars and dtype attributes only."""
+    M, N, K = args["M"], args["N"], args["K"]
+    BM, BN, GM = args["BLOCK_M"], args["BLOCK_N"], args["GROUP_M"]
+    safe_offsets = all(math.ceil(value).bit_length() <= 31
+                       for value in ((M * N) / (BM * BN), M * K, K * N, M * N))
+    return (all(args[name].dtype == torch.bfloat16 for name in ("A", "B", "C"))
+            and args["acc_dtype"] == tl.float32 and args["SPLIT_K"] == 1
+            and safe_offsets and args["stride_am"] == K and args["stride_ak"] == 1
+            and args["stride_bk"] == 1 and args["stride_bn"] == K
+            and args["stride_cm"] == N and args["stride_cn"] == 1
+            and N >= 2 * K and triton.cdiv(M, BM) >= GM and triton.cdiv(N, BN) > 1)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
@@ -72,6 +86,7 @@ def _to_tl_type(ty):
         > 31,
         "UPGRADE_C_OFFS": lambda args: math.ceil(args["M"] * args["N"]).bit_length()
         > 31,
+        "GROUPED": _use_grouped_pid,
     }
 )
 @triton.jit
@@ -102,6 +117,7 @@ def mm_kernel(
     UPGRADE_A_OFFS: tl.constexpr,
     UPGRADE_B_OFFS: tl.constexpr,
     UPGRADE_C_OFFS: tl.constexpr,
+    GROUPED: tl.constexpr,
 ):
     # matrix multiplication
     if UPGRADE:
@@ -110,16 +126,18 @@ def mm_kernel(
     else:
         pid = tl.program_id(0)
         pid_z = tl.program_id(1)
-    # grid_m = tl.cdiv(M, BLOCK_M)
+    grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
-    # # re-order program ID for better L2 performance
-    # width = GROUP_M * grid_n
-    # group_id = pid // width
-    # group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    # pid_m = group_id * GROUP_M + (pid % group_size)
-    # pid_n = (pid % width) // (group_size)
-    pid_m = pid // grid_n
-    pid_n = pid % grid_n
+    if GROUPED:
+        width = GROUP_M * grid_n
+        first_m = (pid // width) * GROUP_M
+        group_size = tl.minimum(grid_m - first_m, GROUP_M)
+        local = pid % width
+        pid_m = first_m + local % group_size
+        pid_n = local // group_size
+    else:
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
     # do matrix multiplication
     if UPGRADE_A_OFFS:
         rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
