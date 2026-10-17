@@ -22,9 +22,18 @@ def _paged_gqa_tile_update(
     page_valid = logical < TABLE_COLS
     if CAUSAL_BOUNDARY:
         page_valid = page_valid & (j < seq_len)
-    # Read page IDs at page granularity for aligned 32/64-key tiles.
+    # Read page IDs at page granularity for aligned 32/64/128-key tiles.
     # Load page IDs once at page granularity, not once for every token lane.
-    if BLOCK_SIZE == 16:
+    if KV_TILE == 128 and (BLOCK_SIZE == 16 or BLOCK_SIZE == 32 or BLOCK_SIZE == 64):
+        first_page = begin // BLOCK_SIZE
+        physical = tl.full((KV_TILE,), 0, tl.int64)
+        for page_offset in tl.static_range(0, KV_TILE // BLOCK_SIZE):
+            page = first_page + page_offset
+            page_id = tl.load(Table + seq * TABLE_STRIDE + page,
+                              (page < TABLE_COLS) & (begin + page_offset * BLOCK_SIZE < seq_len), 0)
+            physical = tl.where(lanes // BLOCK_SIZE == page_offset,
+                                page_id.to(tl.int64), physical)
+    elif BLOCK_SIZE == 16:
         first_page = begin // 16
         p0 = tl.load(Table + seq * TABLE_STRIDE + first_page,
                      (first_page < TABLE_COLS) & (begin < seq_len), 0)
@@ -122,11 +131,19 @@ def iluvatar_paged_gqa_prefill_kernel(
         # The first query sees this entire prefix, so all later rows do too.
         full_end = tl.maximum(0, (context + first_query + 1) // 32 * 32)
         stop = tl.minimum(seq_len, context + tl.minimum(first_query + QUERY_TILE, q_len))
-        # Q8 reuses wider tiles only in the prefix visible to every query row.
+        # Q8/Q16 use wider tiles only in the prefix visible to every query row.
         wide_end = 0
         if QUERY_TILE >= 8:
+            wide128_end = full_end // 128 * 128
+            for begin in range(0, wide128_end, 128):
+                m, l, acc = _paged_gqa_tile_update(
+                    q, K, V, Table, seq, kv_head, positions, valid_rows, context,
+                    begin, seq_len, Scale, m, l, acc,
+                    BLOCK_SIZE, BLOCKS, TABLE_COLS, TABLE_STRIDE,
+                    KS0, KS1, KS2, VS0, VS1, VS2, False, 128, True,
+                )
             wide_end = full_end // 64 * 64
-            for begin in range(0, wide_end, 64):
+            for begin in range(wide128_end, wide_end, 64):
                 m, l, acc = _paged_gqa_tile_update(
                     q, K, V, Table, seq, kv_head, positions, valid_rows, context,
                     begin, seq_len, Scale, m, l, acc,
