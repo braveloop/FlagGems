@@ -30,6 +30,7 @@ def _paged_gqa_decode_segment(
             tile, seq_len, Scale, m, l, acc,
             BLOCK_SIZE, BLOCKS, TABLE_COLS, TABLE_STRIDE,
             KS0, KS1, KS2, VS0, VS1, VS2, False, KV_TILE, KV_TILE == 64,
+            ALLOW_AFFINE=True,
         )
     for tile in range(tl.maximum(begin, full_end), stop, KV_TILE):
         m, l, acc = _paged_gqa_tile_update(

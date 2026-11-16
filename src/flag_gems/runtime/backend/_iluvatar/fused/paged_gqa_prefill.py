@@ -7,6 +7,30 @@ import triton.language as tl
 
 
 @triton.jit
+def _paged_gqa_affine_tile_update(
+    q, K, V, first_physical, kv_head, scale, m, l, acc,
+    KS0: tl.constexpr, KS1: tl.constexpr, KS2: tl.constexpr,
+    VS0: tl.constexpr, VS1: tl.constexpr, VS2: tl.constexpr,
+    KV_TILE: tl.constexpr,
+):
+    # Called only for complete, valid, consecutive pages in separate K/V slabs.
+    lanes = tl.arange(0, KV_TILE)
+    d = tl.arange(0, 128)
+    k_base = K + first_physical * KS0 + kv_head * KS2
+    k = tl.load(k_base + d[:, None] + lanes[None, :] * KS1, stride=KS1)
+    scores = tl.dot(q, k).to(tl.float32) * scale
+    m_new = tl.maximum(m, tl.max(scores, 1))
+    safe_max = tl.where(m_new == -float("inf"), 0.0, m_new)
+    p = tl.exp(scores - safe_max[:, None])
+    alpha = tl.exp(m - safe_max)
+    l = l * alpha + tl.sum(p, 1)
+    v_base = V + first_physical * VS0 + kv_head * VS2
+    v = tl.load(v_base + lanes[:, None] * VS1 + d[None, :], stride=VS1)
+    acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
+    return m_new, l, acc
+
+
+@triton.jit
 def _paged_gqa_tile_update(
     q, K, V, Table, seq, kv_head, positions, valid_rows, context,
     begin, seq_len, scale, m, l, acc,
@@ -15,7 +39,18 @@ def _paged_gqa_tile_update(
     KS2: tl.constexpr, VS0: tl.constexpr, VS1: tl.constexpr,
     VS2: tl.constexpr, CAUSAL_BOUNDARY: tl.constexpr,
     KV_TILE: tl.constexpr = 32, DEFER_V: tl.constexpr = False,
+    ALLOW_AFFINE: tl.constexpr = False,
 ):
+    AFFINE: tl.constexpr = (
+        ALLOW_AFFINE and not CAUSAL_BOUNDARY and KV_TILE == 64
+        and (BLOCK_SIZE == 16 or BLOCK_SIZE == 32 or BLOCK_SIZE == 64)
+        and KV_TILE % BLOCK_SIZE == 0
+        and KS0 == BLOCK_SIZE * KS1 and VS0 == BLOCK_SIZE * VS1
+        and KS1 % 32 == 0 and VS1 % 32 == 0
+        and KS2 % 32 == 0 and VS2 % 32 == 0
+    )
+    first_physical = tl.full((), 0, tl.int64)
+    consecutive = tl.full((), False, tl.int1)
     lanes = tl.arange(0, KV_TILE)
     j = begin + lanes
     logical = j // BLOCK_SIZE
@@ -31,6 +66,12 @@ def _paged_gqa_tile_update(
             page = first_page + page_offset
             page_id = tl.load(Table + seq * TABLE_STRIDE + page,
                               (page < TABLE_COLS) & (begin + page_offset * BLOCK_SIZE < seq_len), 0)
+            if AFFINE:
+                if page_offset == 0:
+                    first_physical = page_id.to(tl.int64)
+                    consecutive = tl.full((), True, tl.int1)
+                else:
+                    consecutive = consecutive & (page_id.to(tl.int64) == first_physical + page_offset)
             physical = tl.where(lanes // BLOCK_SIZE == page_offset,
                                 page_id.to(tl.int64), physical)
     elif BLOCK_SIZE == 16:
@@ -44,6 +85,11 @@ def _paged_gqa_tile_update(
                          (first_page + 2 < TABLE_COLS) & (begin + 32 < seq_len), 0)
             p3 = tl.load(Table + seq * TABLE_STRIDE + first_page + 3,
                          (first_page + 3 < TABLE_COLS) & (begin + 48 < seq_len), 0)
+            if AFFINE:
+                first_physical = p0.to(tl.int64)
+                consecutive = ((p1.to(tl.int64) == first_physical + 1)
+                               & (p2.to(tl.int64) == first_physical + 2)
+                               & (p3.to(tl.int64) == first_physical + 3))
             physical = tl.where(lanes < 32, tl.where(lanes < 16, p0, p1),
                                 tl.where(lanes < 48, p2, p3)).to(tl.int64)
         else:
@@ -54,35 +100,53 @@ def _paged_gqa_tile_update(
                      (first_page < TABLE_COLS) & (begin < seq_len), 0)
         p1 = tl.load(Table + seq * TABLE_STRIDE + first_page + 1,
                      (first_page + 1 < TABLE_COLS) & (begin + 32 < seq_len), 0)
+        if AFFINE:
+            first_physical = p0.to(tl.int64)
+            consecutive = p1.to(tl.int64) == first_physical + 1
         physical = tl.where(lanes < 32, p0, p1).to(tl.int64)
     elif BLOCK_SIZE % KV_TILE == 0:
         first_page = begin // BLOCK_SIZE
         physical = tl.load(Table + seq * TABLE_STRIDE + first_page,
                            (first_page < TABLE_COLS) & (begin < seq_len), 0).to(tl.int64)
+        if AFFINE:
+            first_physical = physical
+            consecutive = tl.full((), True, tl.int1)
         physical = physical + tl.zeros((KV_TILE,), tl.int64)
     else:
         physical = tl.load(Table + seq * TABLE_STRIDE + logical, page_valid, 0).to(tl.int64)
-    page_valid = page_valid & (physical >= 0) & (physical < BLOCKS)
-    d = tl.arange(0, 128)
-    k_address = physical[None, :] * KS0 + (j % BLOCK_SIZE)[None, :] * KS1 + kv_head * KS2 + d[:, None]
-    k = tl.load(K + k_address, page_valid[None, :], 0)
-    if not DEFER_V:
-        v_address = physical[:, None] * VS0 + (j % BLOCK_SIZE)[:, None] * VS1 + kv_head * VS2 + d[None, :]
-        v = tl.load(V + v_address, page_valid[:, None], 0)
-    scores = tl.dot(q, k).to(tl.float32) * scale
-    allowed = page_valid[None, :]
-    if CAUSAL_BOUNDARY:
-        allowed = allowed & valid_rows[:, None] & (j[None, :] <= context + positions[:, None])
-    scores = tl.where(allowed, scores, -float("inf"))
-    m_new = tl.maximum(m, tl.max(scores, 1))
-    safe_max = tl.where(m_new == -float("inf"), 0.0, m_new)
-    p = tl.exp(scores - safe_max[:, None])
-    alpha = tl.exp(m - safe_max)
-    l = l * alpha + tl.sum(p, 1)
-    if DEFER_V:
-        v_address = physical[:, None] * VS0 + (j % BLOCK_SIZE)[:, None] * VS1 + kv_head * VS2 + d[None, :]
-        v = tl.load(V + v_address, page_valid[:, None], 0)
-    acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
+    if AFFINE:
+        consecutive = (consecutive & (begin >= 0) & (begin % BLOCK_SIZE == 0)
+                       & (begin + KV_TILE <= seq_len)
+                       & (begin // BLOCK_SIZE + KV_TILE // BLOCK_SIZE <= TABLE_COLS)
+                       & (first_physical >= 0)
+                       & (first_physical + KV_TILE // BLOCK_SIZE <= BLOCKS))
+    if AFFINE and consecutive:
+        m_new, l, acc = _paged_gqa_affine_tile_update(
+            q, K, V, first_physical, kv_head, scale, m, l, acc,
+            KS0, KS1, KS2, VS0, VS1, VS2, KV_TILE,
+        )
+    else:
+        page_valid = page_valid & (physical >= 0) & (physical < BLOCKS)
+        d = tl.arange(0, 128)
+        k_address = physical[None, :] * KS0 + (j % BLOCK_SIZE)[None, :] * KS1 + kv_head * KS2 + d[:, None]
+        k = tl.load(K + k_address, page_valid[None, :], 0)
+        if not DEFER_V:
+            v_address = physical[:, None] * VS0 + (j % BLOCK_SIZE)[:, None] * VS1 + kv_head * VS2 + d[None, :]
+            v = tl.load(V + v_address, page_valid[:, None], 0)
+        scores = tl.dot(q, k).to(tl.float32) * scale
+        allowed = page_valid[None, :]
+        if CAUSAL_BOUNDARY:
+            allowed = allowed & valid_rows[:, None] & (j[None, :] <= context + positions[:, None])
+        scores = tl.where(allowed, scores, -float("inf"))
+        m_new = tl.maximum(m, tl.max(scores, 1))
+        safe_max = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - safe_max[:, None])
+        alpha = tl.exp(m - safe_max)
+        l = l * alpha + tl.sum(p, 1)
+        if DEFER_V:
+            v_address = physical[:, None] * VS0 + (j % BLOCK_SIZE)[:, None] * VS1 + kv_head * VS2 + d[None, :]
+            v = tl.load(V + v_address, page_valid[:, None], 0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
     return m_new, l, acc
 
 
@@ -171,8 +235,8 @@ def iluvatar_paged_gqa_prefill_kernel(
 def paged_gqa_prefill(query, key_cache, value_cache, output, query_start_loc, seq_lens, block_table, softmax_scale, *, query_tile=8, skip_q1=False):
     """Fill caller-owned output; bridge owns feature/shape compatibility guards."""
     tokens, sequences = query.shape[0], seq_lens.numel()
-    if type(query_tile) is not int or query_tile not in (2, 8, 16):
-        raise ValueError("query_tile must be 2, 8 or 16")
+    if type(query_tile) is not int or query_tile not in (2, 8, 16, 32):
+        raise ValueError("query_tile must be 2, 8, 16 or 32")
     if type(skip_q1) is not bool:
         raise ValueError("skip_q1 must be a bool")
     if not sequences or not tokens:
@@ -184,6 +248,7 @@ def paged_gqa_prefill(query, key_cache, value_cache, output, query_start_loc, se
         block_table.shape[1], block_table.stride(0),
         query.stride(0), query.stride(1), output.stride(0), output.stride(1),
         *key_cache.stride()[:3], *value_cache.stride()[:3],
-        query_tile, skip_q1, num_warps=8 if query_tile >= 8 else 4, num_stages=1,
+        query_tile, skip_q1,
+        num_warps=16 if query_tile == 32 else (8 if query_tile >= 8 else 4), num_stages=1,
     )
     return output

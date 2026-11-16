@@ -182,6 +182,11 @@ def test_short_query_tiles():
         check_case(lengths, contexts, page, True, query_tile=tile)
 
 
+def test_q32_query_boundaries():
+    for page in (16, 48, 64):
+        check_case([31, 32, 33, 0], [127, 128, 129, 0], page, True, query_tile=32)
+
+
 def timed(operation, repeats=7):
     for _ in range(3):
         operation()

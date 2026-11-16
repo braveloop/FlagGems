@@ -26,7 +26,7 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.device_info import get_l2_cache_size, get_sm_count
-from flag_gems.runtime.backend._metax.mm_geometry import MetaXNTGeometryTuner
+
 logger = logging.getLogger(__name__)
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "mm_metax_expand.yaml")
@@ -329,7 +329,7 @@ def mm_kernel_nn(
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("mm_nt"),
-    key=["M", "N", "K"], policy=MetaXNTGeometryTuner,
+    key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs_nt},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nt",
@@ -1220,5 +1220,9 @@ def mm_out(a, b, *, out):
     if nn_mm_scenario(a, b, c, M, N, K):
         return general_mm_nn(a, b, c, M, N, K)
     if nt_mm_scenario(a, b, c, M, N, K):
+        if M % 32 == 0 and 1 <= M // 32 <= 2:
+            from .mm_tile_packed import try_registered
+            if try_registered(a, b, c):
+                return c
         return general_mm_nt(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)

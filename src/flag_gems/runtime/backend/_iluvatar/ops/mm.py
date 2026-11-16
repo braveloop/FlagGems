@@ -221,8 +221,59 @@ def mm_kernel(
         tl.atomic_add(C, acc, mask=mask)
 
 
+@libentry()
+@triton.jit
+def mm_shared_a_two_panel_kernel(
+    A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Two original-size output panels share one rectangular A load per K step.
+    pid = tl.program_id(0)
+    pairs_n = N // (2 * BLOCK_N)
+    rows = (pid // pairs_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols0 = (pid % pairs_n) * (2 * BLOCK_N) + tl.arange(0, BLOCK_N)
+    cols1 = cols0 + BLOCK_N
+    offsets_k = tl.arange(0, BLOCK_K)
+    a_ptrs = A + rows[:, None] * K + offsets_k[None, :]
+    b0_ptrs = B + offsets_k[:, None] + cols0[None, :] * K
+    b1_ptrs = B + offsets_k[:, None] + cols1[None, :] * K
+    acc0 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for _ in range(0, K // BLOCK_K):
+        a = tl.load(a_ptrs)
+        b0 = tl.load(b0_ptrs)
+        b1 = tl.load(b1_ptrs)
+        acc0 = tl.dot(a, b0, acc0)
+        acc1 = tl.dot(a, b1, acc1)
+        a_ptrs += BLOCK_K
+        b0_ptrs += BLOCK_K
+        b1_ptrs += BLOCK_K
+    tl.store(C + rows[:, None] * N + cols0[None, :], acc0.to(C.dtype.element_ty))
+    tl.store(C + rows[:, None] * N + cols1[None, :], acc1.to(C.dtype.element_ty))
+
+
+def _use_shared_a_two_panel(a, b, c, M, N, K):
+    if (any(t.dtype != torch.bfloat16 for t in (a, b, c))
+            or M < 8 * 256 or M % 256 or N < 8 * 128 or N % 256
+            or K < 2 * N or K % 32
+            or max(M * K, K * N, M * N) >= 2 ** 31
+            or a.stride() != (K, 1) or b.stride() != (1, K)
+            or c.stride() != (N, 1)):
+        return False
+    # Reject shared storage, including overlapping views with different offsets.
+    output_storage = c.untyped_storage().data_ptr()
+    return all(t.untyped_storage().data_ptr() != output_storage for t in (a, b))
+
+
 def _launch_mm(a, b, c, M, N, K):
     """Launch Triton matmul _kernel; c must be pre-allocated."""
+    if _use_shared_a_two_panel(a, b, c, M, N, K):
+        with torch_device_fn.device(a.device):
+            mm_shared_a_two_panel_kernel[(M // 256 * (N // 256),)](
+                a, b, c, M, N, K, BLOCK_M=256, BLOCK_N=128, BLOCK_K=32,
+                num_warps=8, num_stages=2,
+            )
+        return c
     ab_dtype = get_higher_dtype(a.dtype, b.dtype)
     acc_dtype_tl = tl.float32
     ab_dtype_tl = _to_tl_type(ab_dtype)
