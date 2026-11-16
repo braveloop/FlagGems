@@ -171,8 +171,8 @@ def iluvatar_paged_gqa_prefill_kernel(
 def paged_gqa_prefill(query, key_cache, value_cache, output, query_start_loc, seq_lens, block_table, softmax_scale, *, query_tile=8, skip_q1=False):
     """Fill caller-owned output; bridge owns feature/shape compatibility guards."""
     tokens, sequences = query.shape[0], seq_lens.numel()
-    if type(query_tile) is not int or query_tile not in (2, 8, 16):
-        raise ValueError("query_tile must be 2, 8 or 16")
+    if type(query_tile) is not int or query_tile not in (2, 8, 16, 32):
+        raise ValueError("query_tile must be 2, 8, 16 or 32")
     if type(skip_q1) is not bool:
         raise ValueError("skip_q1 must be a bool")
     if not sequences or not tokens:
@@ -184,6 +184,7 @@ def paged_gqa_prefill(query, key_cache, value_cache, output, query_start_loc, se
         block_table.shape[1], block_table.stride(0),
         query.stride(0), query.stride(1), output.stride(0), output.stride(1),
         *key_cache.stride()[:3], *value_cache.stride()[:3],
-        query_tile, skip_q1, num_warps=8 if query_tile >= 8 else 4, num_stages=1,
+        query_tile, skip_q1,
+        num_warps=16 if query_tile == 32 else (8 if query_tile >= 8 else 4), num_stages=1,
     )
     return output
