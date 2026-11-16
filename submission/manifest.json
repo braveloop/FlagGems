@@ -3,7 +3,7 @@
   "release_id": "S2-20261116-COMMUNITY-DRAFT-LATEST",
   "team": "bravegpuwinner",
   "prepared_date": "2026-11-16",
-  "publication_status": "blocked_pending_target_runtime",
+  "publication_status": "team_fork_report_review",
   "official_event_zip_submitted": false,
   "validation": {
     "submitted_tree_runtime_verified": false,
@@ -151,5 +151,15 @@
     "attribution": "Existing vendor INT8 GEMM, not claimed as self-developed. Custom work is fused inverse-s A8/RNE preparation, load-time W8/scales, calibration ABI and scoped integration."
   },
   "hash_scope": "Source/distribution payload hashes exclude documentation and submission/manifest.json. Final release index records commits, document and manifest hashes without self-reference.",
-  "repository": "FlagGems"
+  "repository": "FlagGems",
+  "official_submission_status": "blocked_pending_target_runtime",
+  "sharing": {
+    "plan_id": "S2-20261116-TEAM-REPORT-SHARE",
+    "destination": "own GitHub fork only",
+    "purpose": "team report preparation and source review",
+    "runtime_source_ancestor_commit": "f8d285bdfde506c977dc282c4ea771f760a3a4e6",
+    "official_community_pr_created": false,
+    "official_event_submission_complete": false,
+    "documentation_only_since_runtime_source_ancestor": true
+  }
 }
